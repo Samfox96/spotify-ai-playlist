@@ -1,0 +1,15 @@
+﻿.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.db
+*.sqlite
+*.sqlite3
+data/
+Spotify Extended Streaming History/
+Spotify Account Data/
+.env
+*.env.local
