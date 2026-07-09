@@ -135,7 +135,11 @@ def import_playlists(client: spotipy.Spotify) -> dict:
     counts = {
         "playlists": 0, "tracks_seen": 0, "tracks_new_or_updated": 0,
         "skipped_non_track": 0, "errors": 0,
+        # Diagnostic breakdown of *why* items were skipped, so a run that
+        # skips everything is self-explaining instead of a mystery.
+        "skip_reasons": {"no_track_object": 0, "no_id": 0, "is_local": 0, "wrong_type": 0},
     }
+    _sample_logged = {"no_id": 0, "is_local": 0, "wrong_type": 0}
 
     results = client.current_user_playlists(limit=_PLAYLIST_PAGE_SIZE)
     playlists = []
@@ -144,8 +148,12 @@ def import_playlists(client: spotipy.Spotify) -> dict:
         results = client.next(results) if results.get("next") else None
 
     logger.info("Found %d playlists", len(playlists))
+    quota_blocked = False
 
     for pl in playlists:
+        if quota_blocked:
+            counts["errors"] += 1
+            continue
         if not pl or not pl.get("id"):
             continue
         try:
@@ -160,11 +168,46 @@ def import_playlists(client: spotipy.Spotify) -> dict:
                     for item in items_page.get("items", []):
                         track = item.get("track")
                         counts["tracks_seen"] += 1
-                        is_track_type = (track or {}).get("type", "track") == "track"
-                        if not track or not track.get("id") or track.get("is_local") or not is_track_type:
+
+                        if not track:
                             counts["skipped_non_track"] += 1
+                            counts["skip_reasons"]["no_track_object"] += 1
                             position += 1
                             continue
+                        if not track.get("id"):
+                            counts["skipped_non_track"] += 1
+                            counts["skip_reasons"]["no_id"] += 1
+                            if _sample_logged["no_id"] < 2:
+                                logger.warning(
+                                    "SAMPLE [no_id] in '%s': %s",
+                                    pl.get("name"), json.dumps(track)[:600],
+                                )
+                                _sample_logged["no_id"] += 1
+                            position += 1
+                            continue
+                        if track.get("is_local"):
+                            counts["skipped_non_track"] += 1
+                            counts["skip_reasons"]["is_local"] += 1
+                            if _sample_logged["is_local"] < 2:
+                                logger.warning(
+                                    "SAMPLE [is_local] in '%s': %s",
+                                    pl.get("name"), json.dumps(track)[:600],
+                                )
+                                _sample_logged["is_local"] += 1
+                            position += 1
+                            continue
+                        if track.get("type", "track") != "track":
+                            counts["skipped_non_track"] += 1
+                            counts["skip_reasons"]["wrong_type"] += 1
+                            if _sample_logged["wrong_type"] < 2:
+                                logger.warning(
+                                    "SAMPLE [wrong_type=%s] in '%s': %s",
+                                    track.get("type"), pl.get("name"), json.dumps(track)[:600],
+                                )
+                                _sample_logged["wrong_type"] += 1
+                            position += 1
+                            continue
+
                         try:
                             for artist in track.get("artists") or []:
                                 _upsert_artist(conn, artist)
@@ -185,6 +228,20 @@ def import_playlists(client: spotipy.Spotify) -> dict:
                 items_page = client.next(items_page) if items_page.get("next") else None
             time.sleep(0.05)
         except spotipy.SpotifyException as e:
+            if e.http_status == 403:
+                if not quota_blocked:
+                    logger.error(
+                        "403 Forbidden on playlist_items -- this means Spotify "
+                        "Extended Quota Mode isn't approved yet for your app. "
+                        "Playlist track listing is blocked (playlist names/metadata "
+                        "still worked, which is why %d playlists were found and saved). "
+                        "Skipping remaining playlists instead of retrying each one; "
+                        "just re-run this command once quota mode is approved.",
+                        len(playlists),
+                    )
+                quota_blocked = True
+                counts["errors"] += 1
+                continue
             logger.error("Failed to import playlist %s: %s", pl.get("name"), e)
             counts["errors"] += 1
             time.sleep(0.5)
