@@ -123,7 +123,7 @@ def enrich_stub_tracks(client: spotipy.Spotify) -> dict:
         try:
             result = client.tracks(batch)
         except spotipy.SpotifyException as e:
-            logger.error("API error on batch: %s", e)
+       logger.error("API error on batch: %s", e)
             counts["errors"] += len(batch)
             time.sleep(1)
             continue
