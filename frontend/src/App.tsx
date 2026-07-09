@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react'
-import { getAuthStatus, importLikedSongs, importAudioFeatures, getImportHistory } from './services/api'
+import { getAuthStatus, importLikedSongs, importAudioFeatures, importPlaylists, getImportHistory } from './services/api'
 import ReviewQueue from './pages/ReviewQueue'
 import Dashboard from './pages/Dashboard'
+import Discovery from './pages/Discovery'
 import './App.css'
 
-type Tab = 'dashboard' | 'review' | 'import'
+type Tab = 'dashboard' | 'review' | 'discovery' | 'import'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('review')
@@ -17,13 +18,17 @@ export default function App() {
     getAuthStatus().then(d => { if (d.authenticated) setUser(d.user) }).catch(() => {})
   }, [])
 
-  const runImport = async (type: 'liked' | 'features', full = false) => {
+  const runImport = async (type: 'liked' | 'features' | 'playlists', full = false) => {
     setImporting(type)
-    setImportLog([`Starting ${type === 'liked' ? 'liked songs' : 'audio features'} import...`])
+    setImportLog([`Starting ${type === 'liked' ? 'liked songs' : type === 'features' ? 'audio features' : 'playlists'} import...`])
     try {
-      const result = type === 'liked' ? await importLikedSongs(!full) : await importAudioFeatures()
+      const result = type === 'liked'
+        ? await importLikedSongs(!full)
+        : type === 'features'
+        ? await importAudioFeatures()
+        : await importPlaylists()
       const c = result.counts
-      setImportLog(prev => [...prev, `Done: ${c.found ?? c.processed ?? 0} processed | ${c.new ?? c.success ?? 0} new | ${c.errors} errors`])
+      setImportLog(prev => [...prev, `Done: ${c.found ?? c.processed ?? c.playlists ?? 0} processed | ${c.new ?? c.success ?? c.tracks_new_or_updated ?? 0} new | ${c.errors} errors`])
       getImportHistory().then(setImportHistory)
     } catch (e: any) {
       setImportLog(prev => [...prev, `Error: ${e.response?.data?.error || e.message}`])
@@ -46,6 +51,7 @@ export default function App() {
         <div className="nav-tabs">
           <button className={`nav-tab ${tab === 'dashboard' ? 'active' : ''}`} onClick={() => setTab('dashboard')}>Dashboard</button>
           <button className={`nav-tab ${tab === 'review' ? 'active' : ''}`} onClick={() => setTab('review')}>⚡ Review Queue</button>
+          <button className={`nav-tab ${tab === 'discovery' ? 'active' : ''}`} onClick={() => setTab('discovery')}>🔍 Discovery</button>
           <button className={`nav-tab ${tab === 'import' ? 'active' : ''}`} onClick={() => setTab('import')}>Import</button>
         </div>
         {user && (
@@ -59,6 +65,7 @@ export default function App() {
       <main className="main">
         {tab === 'dashboard' && <Dashboard />}
         {tab === 'review' && <ReviewQueue onStatsChange={() => {}} />}
+        {tab === 'discovery' && <Discovery />}
         {tab === 'import' && (
           <div className="import-page">
             <h1>Data Import</h1>
@@ -79,6 +86,15 @@ export default function App() {
                 <div className="btn-row">
                   <button className="btn btn-primary" disabled={!!importing} onClick={() => runImport('features')}>
                     {importing === 'features' ? 'Fetching…' : 'Fetch Features'}
+                  </button>
+                </div>
+              </div>
+              <div className="import-card">
+                <h2>Playlists</h2>
+                <p>Import all your playlists and their tracks, with full metadata.</p>
+                <div className="btn-row">
+                  <button className="btn btn-primary" disabled={!!importing} onClick={() => runImport('playlists')}>
+                    {importing === 'playlists' ? 'Importing…' : 'Import Playlists'}
                   </button>
                 </div>
               </div>

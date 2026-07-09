@@ -50,6 +50,17 @@ def cmd_enrich_tracks(args):
     counts = enrich_stub_tracks(client)
     print(f"\nDone: {counts['enriched']} enriched | {counts['errors']} errors | {counts['processed']} processed\n")
 
+def cmd_import_playlists(args):
+    from backend.auth.spotify_auth import get_spotify_client
+    from backend.importers.playlists import import_playlists
+    client = get_spotify_client()
+    print("\nImporting playlists and their tracks...\n")
+    counts = import_playlists(client)
+    print(
+        f"\nDone: {counts['playlists']} playlists | {counts['tracks_new_or_updated']} tracks "
+        f"| {counts['skipped_non_track']} skipped (local/removed) | {counts['errors']} errors\n"
+    )
+
 def cmd_stats(args):
     from backend.db.database import init_db, db_conn
     import json
@@ -117,6 +128,9 @@ def main():
 
     p_enrich = sub.add_parser("enrich-tracks", help="Backfill full metadata for tracks discovered via streaming history")
     p_enrich.set_defaults(func=cmd_enrich_tracks)
+
+    p_playlists = sub.add_parser("import-playlists", help="Import all playlists and their tracks")
+    p_playlists.set_defaults(func=cmd_import_playlists)
 
     p_stats = sub.add_parser("stats")
     p_stats.set_defaults(func=cmd_stats)

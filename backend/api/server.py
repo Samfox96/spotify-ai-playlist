@@ -331,6 +331,175 @@ def trigger_streaming_history_import():
         return jsonify({"status": "failed", "error": str(e)}), 500
 
 
+@app.route("/api/discovery/overview")
+def discovery_overview():
+    """
+    Cross-references play_history against playlist_tracks and liked_songs to
+    surface: tracks played heavily but never added to any playlist, tracks
+    trending upward in the last 60 days vs the 60 days before that, and
+    forgotten favourites. Each bucket returns track_ids so the frontend can
+    turn any bucket directly into a real Spotify playlist.
+    """
+    with db_conn() as conn:
+        has_history = conn.execute(
+            "SELECT COUNT(*) as n FROM play_history WHERE source = 'spotify_export'"
+        ).fetchone()["n"]
+        if has_history == 0:
+            return jsonify({"available": False})
+
+        # Heavily played but never on any playlist -- "ready to playlist"
+        unplaylisted = conn.execute("""
+            SELECT ph.track_id, t.name, t.primary_artist_name as artist,
+                   ph.play_count, ph.total_minutes
+            FROM (
+                SELECT track_id, COUNT(*) as play_count,
+                       ROUND(SUM(ms_played) / 60000.0, 1) as total_minutes
+                FROM play_history WHERE source = 'spotify_export'
+                GROUP BY track_id
+            ) ph
+            JOIN tracks t ON t.id = ph.track_id
+            LEFT JOIN playlist_tracks pt ON pt.track_id = ph.track_id
+            WHERE pt.track_id IS NULL AND ph.play_count >= 10
+            GROUP BY ph.track_id
+            ORDER BY ph.play_count DESC
+            LIMIT 25
+        """).fetchall()
+
+        # Trending up: plays in the last 60 days vs the 60 days before that
+        trending_tracks = conn.execute("""
+            WITH recent AS (
+                SELECT track_id, COUNT(*) as recent_plays
+                FROM play_history
+                WHERE source = 'spotify_export' AND played_at >= datetime('now', '-60 days')
+                GROUP BY track_id
+            ),
+            prior AS (
+                SELECT track_id, COUNT(*) as prior_plays
+                FROM play_history
+                WHERE source = 'spotify_export'
+                  AND played_at >= datetime('now', '-120 days')
+                  AND played_at <  datetime('now', '-60 days')
+                GROUP BY track_id
+            )
+            SELECT r.track_id, t.name, t.primary_artist_name as artist,
+                   r.recent_plays, COALESCE(p.prior_plays, 0) as prior_plays,
+                   (r.recent_plays - COALESCE(p.prior_plays, 0)) as delta
+            FROM recent r
+            JOIN tracks t ON t.id = r.track_id
+            LEFT JOIN prior p ON p.track_id = r.track_id
+            WHERE r.recent_plays >= 5 AND delta > 0
+            ORDER BY delta DESC
+            LIMIT 25
+        """).fetchall()
+
+        # Same idea at artist level -- rising artists, not just individual tracks
+        trending_artists = conn.execute("""
+            WITH recent AS (
+                SELECT t.primary_artist_name as artist, COUNT(*) as recent_plays
+                FROM play_history ph JOIN tracks t ON t.id = ph.track_id
+                WHERE ph.source = 'spotify_export' AND ph.played_at >= datetime('now', '-60 days')
+                  AND t.primary_artist_name IS NOT NULL
+                GROUP BY t.primary_artist_name
+            ),
+            prior AS (
+                SELECT t.primary_artist_name as artist, COUNT(*) as prior_plays
+                FROM play_history ph JOIN tracks t ON t.id = ph.track_id
+                WHERE ph.source = 'spotify_export'
+                  AND ph.played_at >= datetime('now', '-120 days')
+                  AND ph.played_at <  datetime('now', '-60 days')
+                  AND t.primary_artist_name IS NOT NULL
+                GROUP BY t.primary_artist_name
+            )
+            SELECT r.artist, r.recent_plays, COALESCE(p.prior_plays, 0) as prior_plays,
+                   (r.recent_plays - COALESCE(p.prior_plays, 0)) as delta
+            FROM recent r
+            LEFT JOIN prior p ON p.artist = r.artist
+            WHERE r.recent_plays >= 5 AND delta > 0
+            ORDER BY delta DESC
+            LIMIT 15
+        """).fetchall()
+
+        # Forgotten favourites, same definition as the listening dashboard,
+        # but including track_id here so it can seed a playlist
+        forgotten = conn.execute("""
+            SELECT ph.track_id, t.name, t.primary_artist_name as artist,
+                   COUNT(*) as play_count,
+                   MAX(ph.played_at) as last_played_at,
+                   CAST((julianday('now') - julianday(MAX(ph.played_at))) AS INTEGER) as days_since_played
+            FROM play_history ph
+            JOIN tracks t ON t.id = ph.track_id
+            JOIN liked_songs ls ON ls.track_id = t.id
+            WHERE ph.source = 'spotify_export'
+            GROUP BY ph.track_id
+            HAVING play_count >= 5 AND days_since_played > 180
+            ORDER BY play_count DESC
+            LIMIT 25
+        """).fetchall()
+
+    return jsonify({
+        "available": True,
+        "unplaylisted_high_plays": [dict(r) for r in unplaylisted],
+        "trending_tracks": [dict(r) for r in trending_tracks],
+        "trending_artists": [dict(r) for r in trending_artists],
+        "forgotten_favourites": [dict(r) for r in forgotten],
+    })
+
+
+@app.route("/api/playlists/create", methods=["POST"])
+def create_playlist():
+    """
+    Creates a real playlist on Spotify from a list of track_ids, then mirrors
+    it into the local playlists/playlist_tracks tables so it shows up
+    immediately in future imports/dashboards without waiting on the next
+    import-playlists run.
+    """
+    data = request.json or {}
+    name = data.get("name")
+    track_ids = data.get("track_ids") or []
+    description = data.get("description", "Created by Music Intelligence")
+
+    if not name or not track_ids:
+        return jsonify({"error": "name and track_ids are required"}), 400
+
+    try:
+        client = get_spotify_client()
+        user_id = client.me()["id"]
+        playlist = client.user_playlist_create(
+            user_id, name, public=False, description=description
+        )
+
+        # Spotify caps playlist_add_items at 100 URIs per call
+        uris = [f"spotify:track:{tid}" for tid in track_ids]
+        for i in range(0, len(uris), 100):
+            client.playlist_add_items(playlist["id"], uris[i:i + 100])
+
+        from backend.importers.playlists import _upsert_playlist, _upsert_playlist_track
+        with db_conn() as conn:
+            _upsert_playlist(conn, playlist)
+            for position, track_id in enumerate(track_ids):
+                _upsert_playlist_track(conn, playlist["id"], track_id, None, user_id, position)
+
+        return jsonify({
+            "ok": True,
+            "playlist_id": playlist["id"],
+            "spotify_url": playlist.get("external_urls", {}).get("spotify"),
+            "track_count": len(track_ids),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/import/playlists", methods=["POST"])
+def trigger_playlist_import():
+    try:
+        client = get_spotify_client()
+        from backend.importers.playlists import import_playlists
+        counts = import_playlists(client)
+        return jsonify({"status": "completed", "counts": counts})
+    except Exception as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
+
+
 def run():
     init_db()
     logger.info("Starting Music Intelligence API on port %d", config.FLASK_PORT)

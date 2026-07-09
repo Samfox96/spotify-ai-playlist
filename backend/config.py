@@ -13,6 +13,8 @@ class Config:
         "user-library-read",
         "playlist-read-private",
         "playlist-read-collaborative",
+        "playlist-modify-private",
+        "playlist-modify-public",
         "user-read-recently-played",
         "user-top-read",
         "user-read-playback-state",

@@ -354,6 +354,24 @@ kbd {
 .evidence-sub { color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .evidence-stats { display: flex; gap: 12px; color: var(--text-muted); font-size: 11px; white-space: nowrap; flex-shrink: 0; }
 
+/* ── Discovery ──────────────────────────────────────────────────────────── */
+.discovery-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.discovery-header h1 { margin-bottom: 0; }
+.import-msg { font-size: 13px; color: var(--accent-2); margin-bottom: 16px; }
+.bucket-count { color: var(--text-muted); font-weight: 400; }
+.bucket-desc { font-size: 12px; color: var(--text-muted); margin-bottom: 12px; margin-top: -8px; }
+.bucket-more { text-align: center; font-size: 11px; color: var(--text-muted); padding: 8px 0 0; }
+.playlist-create-row {
+  display: flex; gap: 8px; margin-top: 16px; padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.playlist-name-input {
+  flex: 1; background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 12px; color: var(--text); font-size: 13px;
+}
+.playlist-name-input:focus { outline: none; border-color: var(--accent); }
+.playlist-create-error { color: #f87171; font-size: 12px; margin-top: 8px; }
+
 .chart-tooltip {
   background: var(--surface-2); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 12px; font-size: 12px; color: var(--text);
