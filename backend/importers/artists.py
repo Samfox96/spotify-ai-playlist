@@ -50,6 +50,16 @@ def import_artist_genres(client: spotipy.Spotify) -> dict:
             results = client.artists(batch)
             artists = results.get("artists", [])
         except spotipy.SpotifyException as e:
+            if e.http_status == 403:
+                logger.error(
+                    "403 Forbidden on artists endpoint -- this means Spotify "
+                    "Extended Quota Mode isn't approved yet for your app. "
+                    "Stopping now instead of retrying every batch. This will "
+                    "start working once Spotify approves the quota request; "
+                    "no code change needed, just re-run this command later."
+                )
+                counts["errors"] += len(artist_ids) - i
+                break
             logger.error("API error fetching artists batch: %s", e)
             counts["errors"] += len(batch)
             time.sleep(1)
