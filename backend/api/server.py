@@ -119,11 +119,25 @@ def review_queue():
                 t.duration_ms, t.popularity, t.preview_url, t.spotify_url, t.explicit,
                 al.name AS album_name, al.release_date, al.image_url AS album_image, al.album_type,
                 af.energy, af.valence, af.tempo, af.danceability, af.acousticness,
-                af.instrumentalness, af.speechiness
+                af.instrumentalness, af.speechiness,
+                ph.play_count, ph.total_minutes, ph.skip_rate_pct,
+                ph.last_played_at, ph.days_since_played
             FROM liked_songs ls
             JOIN tracks t ON ls.track_id = t.id
             LEFT JOIN albums al ON t.album_id = al.id
             LEFT JOIN audio_features af ON ls.track_id = af.track_id
+            LEFT JOIN (
+                SELECT
+                    track_id,
+                    COUNT(*) as play_count,
+                    ROUND(SUM(ms_played) / 60000.0, 1) as total_minutes,
+                    ROUND(AVG(skipped) * 100, 1) as skip_rate_pct,
+                    MAX(played_at) as last_played_at,
+                    CAST((julianday('now') - julianday(MAX(played_at))) AS INTEGER) as days_since_played
+                FROM play_history
+                WHERE source = 'spotify_export'
+                GROUP BY track_id
+            ) ph ON ph.track_id = ls.track_id
             WHERE ls.review_status = 'unreviewed'
             ORDER BY ls.liked_at ASC
             LIMIT ?
@@ -191,6 +205,130 @@ def review_stats():
         "progress_pct": round((reviewed / total * 100) if total > 0 else 0, 1),
         "breakdown": breakdown,
     })
+
+
+@app.route("/api/dashboard/listening")
+def dashboard_listening():
+    """Real listening-behaviour analytics from play_history (Extended
+    Streaming History export). Distinct from dashboard_overview, which is
+    based on when songs were liked, not when/how they were actually played.
+    """
+    with db_conn() as conn:
+        has_history = conn.execute(
+            "SELECT COUNT(*) as n FROM play_history WHERE source = 'spotify_export'"
+        ).fetchone()["n"]
+
+        if has_history == 0:
+            return jsonify({"available": False})
+
+        # Plays per year (actual listening activity, not like-dates)
+        plays_by_year = conn.execute("""
+            SELECT substr(played_at, 1, 4) as year, COUNT(*) as plays,
+                   SUM(CASE WHEN ms_played > 30000 THEN 1 ELSE 0 END) as real_plays
+            FROM play_history WHERE source = 'spotify_export'
+            GROUP BY year ORDER BY year
+        """).fetchall()
+
+        # Top tracks by actual listening time (not just liked-song count)
+        top_by_time = conn.execute("""
+            SELECT t.name, t.primary_artist_name as artist,
+                   COUNT(*) as play_count,
+                   ROUND(SUM(ph.ms_played) / 60000.0, 1) as total_minutes,
+                   ROUND(AVG(ph.skipped) * 100, 1) as skip_rate_pct
+            FROM play_history ph
+            JOIN tracks t ON t.id = ph.track_id
+            WHERE ph.source = 'spotify_export'
+            GROUP BY ph.track_id
+            ORDER BY total_minutes DESC
+            LIMIT 15
+        """).fetchall()
+
+        # Forgotten favourites: liked, decent play history, but not played
+        # in a long time -- the brief's "forgotten gems" concept made concrete
+        forgotten = conn.execute("""
+            SELECT t.name, t.primary_artist_name as artist,
+                   COUNT(*) as play_count,
+                   MAX(ph.played_at) as last_played_at,
+                   CAST((julianday('now') - julianday(MAX(ph.played_at))) AS INTEGER) as days_since_played
+            FROM play_history ph
+            JOIN tracks t ON t.id = ph.track_id
+            JOIN liked_songs ls ON ls.track_id = t.id
+            WHERE ph.source = 'spotify_export'
+            GROUP BY ph.track_id
+            HAVING play_count >= 5 AND days_since_played > 365
+            ORDER BY play_count DESC, days_since_played DESC
+            LIMIT 15
+        """).fetchall()
+
+        # Skip rate distribution -- which tracks you consistently skip
+        # (candidates for archiving, per the project's evidence-based principle)
+        high_skip = conn.execute("""
+            SELECT t.name, t.primary_artist_name as artist,
+                   COUNT(*) as total_plays,
+                   ROUND(AVG(ph.skipped) * 100, 1) as skip_rate_pct
+            FROM play_history ph
+            JOIN tracks t ON t.id = ph.track_id
+            JOIN liked_songs ls ON ls.track_id = t.id
+            WHERE ph.source = 'spotify_export'
+            GROUP BY ph.track_id
+            HAVING total_plays >= 5 AND skip_rate_pct >= 50
+            ORDER BY skip_rate_pct DESC, total_plays DESC
+            LIMIT 15
+        """).fetchall()
+
+        # Overall skip rate + listening totals
+        overview = conn.execute("""
+            SELECT COUNT(*) as total_plays,
+                   ROUND(AVG(skipped) * 100, 1) as overall_skip_rate_pct,
+                   ROUND(SUM(ms_played) / 3600000.0, 1) as total_hours,
+                   COUNT(DISTINCT track_id) as unique_tracks_played,
+                   MIN(played_at) as earliest_play,
+                   MAX(played_at) as latest_play
+            FROM play_history WHERE source = 'spotify_export'
+        """).fetchone()
+
+        # Tracks discovered via history but never liked (streamed only)
+        streamed_never_liked = conn.execute("""
+            SELECT COUNT(DISTINCT ph.track_id) as n
+            FROM play_history ph
+            LEFT JOIN liked_songs ls ON ls.track_id = ph.track_id
+            WHERE ph.source = 'spotify_export' AND ls.track_id IS NULL
+        """).fetchone()["n"]
+
+    return jsonify({
+        "available": True,
+        "overview": dict(overview),
+        "streamed_never_liked": streamed_never_liked,
+        "plays_by_year": [dict(r) for r in plays_by_year],
+        "top_by_listening_time": [dict(r) for r in top_by_time],
+        "forgotten_favourites": [dict(r) for r in forgotten],
+        "high_skip_rate": [dict(r) for r in high_skip],
+    })
+
+
+@app.route("/api/import/enrich-tracks", methods=["POST"])
+def trigger_track_enrichment():
+    try:
+        client = get_spotify_client()
+        from backend.importers.track_enrichment import enrich_stub_tracks
+        counts = enrich_stub_tracks(client)
+        return jsonify({"status": "completed", "counts": counts})
+    except Exception as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
+
+
+@app.route("/api/import/streaming-history", methods=["POST"])
+def trigger_streaming_history_import():
+    data = request.json or {}
+    export_dir = data.get("export_dir")
+    if not export_dir:
+        return jsonify({"error": "export_dir required"}), 400
+    try:
+        from backend.importers.streaming_history_importer import import_streaming_history
+        counts = import_streaming_history(export_dir)
+        return jsonify({"status": "completed", "counts": counts})
+    except Exception as e:
+        return jsonify({"status": "failed", "error": str(e)}), 500
 
 
 def run():

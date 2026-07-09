@@ -35,6 +35,57 @@ function FeatureBar({ label, value, color }: { label: string; value: number | nu
   )
 }
 
+function EvidencePanel({ track }: { track: QueueTrack }) {
+  if (track.play_count === null || track.play_count === undefined) {
+    return (
+      <div className="evidence-panel evidence-panel-empty">
+        No listening history for this track yet.
+      </div>
+    )
+  }
+
+  const monthsAgo = track.days_since_played !== null ? Math.round(track.days_since_played / 30) : null
+  const highSkip = (track.skip_rate_pct ?? 0) >= 50
+  const stale = (track.days_since_played ?? 0) > 365
+
+  return (
+    <div className="evidence-panel">
+      <div className="evidence-panel-title">Listening evidence</div>
+      <div className="evidence-panel-grid">
+        <div className="evidence-stat">
+          <span className="evidence-stat-value">{track.play_count}</span>
+          <span className="evidence-stat-label">plays</span>
+        </div>
+        <div className="evidence-stat">
+          <span className="evidence-stat-value">{track.total_minutes?.toLocaleString() ?? '—'}</span>
+          <span className="evidence-stat-label">minutes</span>
+        </div>
+        <div className="evidence-stat">
+          <span className="evidence-stat-value" style={{ color: highSkip ? '#f87171' : undefined }}>
+            {track.skip_rate_pct}%
+          </span>
+          <span className="evidence-stat-label">skip rate</span>
+        </div>
+        <div className="evidence-stat">
+          <span className="evidence-stat-value" style={{ color: stale ? '#fbbf24' : undefined }}>
+            {monthsAgo !== null ? `${monthsAgo}mo` : '—'}
+          </span>
+          <span className="evidence-stat-label">since last played</span>
+        </div>
+      </div>
+      {(highSkip || stale) && (
+        <div className="evidence-hint">
+          {highSkip && stale
+            ? 'Frequently skipped and not played in a while — possible archive candidate.'
+            : highSkip
+            ? 'Frequently skipped when it plays.'
+            : "Hasn't been played in a while."}
+        </div>
+      )}
+    </div>
+  )
+}
+
 const DECISIONS = [
   { status: 'love',              label: '❤️ Love',    key: '1', desc: 'All-time favourite',       color: '#f9a8d4' },
   { status: 'keep',              label: '✅ Keep',    key: '2', desc: 'Still in rotation',        color: '#34d399' },
@@ -322,6 +373,8 @@ export default function ReviewQueue({ onStatsChange }: Props) {
               </div>
             )}
             {track.tempo && <div className="tempo-badge">{Math.round(track.tempo)} BPM</div>}
+
+            <EvidencePanel track={track} />
 
             {track.spotify_url && (
               <a href={track.spotify_url} target="_blank" rel="noreferrer" className="spotify-link">

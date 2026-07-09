@@ -33,6 +33,23 @@ def cmd_import_artists(args):
     counts = import_artist_genres(client)
     print(f"\nDone: {counts['updated']} artists updated | {counts['errors']} errors\n")
 
+def cmd_import_history(args):
+    from backend.importers.streaming_history_importer import import_streaming_history
+    print(f"\nImporting streaming history from: {args.export}\n")
+    counts = import_streaming_history(args.export)
+    print(
+        f"\nDone: {counts['new']} new plays | {counts['duplicates']} duplicates | "
+        f"{counts['stubbed']} new tracks discovered (streamed but never liked)\n"
+    )
+
+def cmd_enrich_tracks(args):
+    from backend.auth.spotify_auth import get_spotify_client
+    from backend.importers.track_enrichment import enrich_stub_tracks
+    client = get_spotify_client()
+    print("\nEnriching stub tracks (streamed but never liked) with full Spotify metadata...\n")
+    counts = enrich_stub_tracks(client)
+    print(f"\nDone: {counts['enriched']} enriched | {counts['errors']} errors | {counts['processed']} processed\n")
+
 def cmd_stats(args):
     from backend.db.database import init_db, db_conn
     import json
@@ -93,6 +110,13 @@ def main():
 
     p_artists = sub.add_parser("import-artists", help="Fetch genre data for all artists")
     p_artists.set_defaults(func=cmd_import_artists)
+
+    p_history = sub.add_parser("import-history", help="Import Spotify Extended Streaming History export")
+    p_history.add_argument("--export", required=True, help="Path to 'Spotify Extended Streaming History' folder")
+    p_history.set_defaults(func=cmd_import_history)
+
+    p_enrich = sub.add_parser("enrich-tracks", help="Backfill full metadata for tracks discovered via streaming history")
+    p_enrich.set_defaults(func=cmd_enrich_tracks)
 
     p_stats = sub.add_parser("stats")
     p_stats.set_defaults(func=cmd_stats)

@@ -31,6 +31,23 @@ interface DashboardData {
   energy_distribution: { bucket: string; n: number }[]
 }
 
+interface ListeningData {
+  available: boolean
+  overview?: {
+    total_plays: number
+    overall_skip_rate_pct: number
+    total_hours: number
+    unique_tracks_played: number
+    earliest_play: string
+    latest_play: string
+  }
+  streamed_never_liked?: number
+  plays_by_year?: { year: string; plays: number; real_plays: number }[]
+  top_by_listening_time?: { name: string; artist: string; play_count: number; total_minutes: number; skip_rate_pct: number }[]
+  forgotten_favourites?: { name: string; artist: string; play_count: number; last_played_at: string; days_since_played: number }[]
+  high_skip_rate?: { name: string; artist: string; total_plays: number; skip_rate_pct: number }[]
+}
+
 const STATUS_COLORS: Record<string, string> = {
   love: '#f9a8d4',
   keep: '#34d399',
@@ -86,12 +103,19 @@ function CustomTooltip({ active, payload, label }: any) {
 
 export default function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null)
+  const [listening, setListening] = useState<ListeningData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    axios.get('/api/dashboard/overview')
-      .then(r => setData(r.data))
+    Promise.all([
+      axios.get('/api/dashboard/overview'),
+      axios.get('/api/dashboard/listening'),
+    ])
+      .then(([overviewRes, listeningRes]) => {
+        setData(overviewRes.data)
+        setListening(listeningRes.data)
+      })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
   }, [])
@@ -180,7 +204,7 @@ export default function Dashboard() {
                       <Cell key={i} fill={STATUS_COLORS[entry.status] ?? '#666'} />
                     ))}
                   </Pie>
-                  <Tooltip formatter={(val: number, name: string) => [val.toLocaleString(), name]} />
+                  <Tooltip formatter={((val: any, name: any) => [Number(val).toLocaleString(), name]) as any} />
                 </PieChart>
               </ResponsiveContainer>
               <div className="pie-legend">
@@ -304,6 +328,113 @@ export default function Dashboard() {
         </SectionCard>
 
       </div>
+
+      {/* --- Real Listening Data (from Extended Streaming History) --- */}
+      {listening?.available && (
+        <>
+          <h1 style={{ marginTop: 32 }}>Listening Behaviour</h1>
+          <div className="stat-pills">
+            <StatPill label="Total Plays" value={listening.overview!.total_plays} accent />
+            <StatPill label="Hours Listened" value={listening.overview!.total_hours.toLocaleString()} />
+            <StatPill label="Unique Tracks Played" value={listening.overview!.unique_tracks_played} />
+            <StatPill label="Skip Rate" value={`${listening.overview!.overall_skip_rate_pct}%`} />
+            <StatPill label="Streamed, Never Liked" value={listening.streamed_never_liked ?? 0} sub="Hidden-gem candidates" />
+          </div>
+
+          <div className="dash-grid">
+            {/* Real listening activity by year, vs. like-dates above */}
+            <SectionCard title="Plays Per Year (Actual Listening)" className="span-2">
+              {listening.plays_by_year && listening.plays_by_year.length > 0 ? (
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={listening.plays_by_year} margin={{ top: 4, right: 8, bottom: 0, left: -20 }}>
+                    <XAxis dataKey="year" tick={{ fontSize: 11, fill: 'var(--text-muted)' }} />
+                    <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Bar dataKey="plays" name="Total plays" fill="var(--accent)" radius={[3, 3, 0, 0]} />
+                    <Bar dataKey="real_plays" name="Full plays (>30s)" fill="#34d399" radius={[3, 3, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="no-data">No listening history yet</div>
+              )}
+            </SectionCard>
+
+            {/* Top tracks by actual minutes listened -- not just liked-song count */}
+            <SectionCard title="Top Tracks by Listening Time" className="span-2">
+              {listening.top_by_listening_time && listening.top_by_listening_time.length > 0 ? (
+                <div className="evidence-list">
+                  {listening.top_by_listening_time.map((t, i) => (
+                    <div key={i} className="evidence-row">
+                      <div className="evidence-main">
+                        <span className="evidence-name">{t.name}</span>
+                        <span className="evidence-sub">{t.artist}</span>
+                      </div>
+                      <div className="evidence-stats">
+                        <span>{t.total_minutes.toLocaleString()} min</span>
+                        <span>{t.play_count} plays</span>
+                        <span>{t.skip_rate_pct}% skip</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="no-data">No listening history yet</div>
+              )}
+            </SectionCard>
+
+            {/* Forgotten gems: liked, heavily played once, then abandoned */}
+            <SectionCard title="Forgotten Favourites" className="span-2">
+              {listening.forgotten_favourites && listening.forgotten_favourites.length > 0 ? (
+                <div className="evidence-list">
+                  {listening.forgotten_favourites.map((t, i) => (
+                    <div key={i} className="evidence-row">
+                      <div className="evidence-main">
+                        <span className="evidence-name">{t.name}</span>
+                        <span className="evidence-sub">{t.artist}</span>
+                      </div>
+                      <div className="evidence-stats">
+                        <span>{t.play_count} plays</span>
+                        <span>{Math.round(t.days_since_played / 30)} months ago</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="no-data">None found -- nothing you loved has gone quiet yet</div>
+              )}
+            </SectionCard>
+
+            {/* Archive candidates by evidence: liked but consistently skipped */}
+            <SectionCard title="Frequently Skipped" className="span-2">
+              {listening.high_skip_rate && listening.high_skip_rate.length > 0 ? (
+                <div className="evidence-list">
+                  {listening.high_skip_rate.map((t, i) => (
+                    <div key={i} className="evidence-row">
+                      <div className="evidence-main">
+                        <span className="evidence-name">{t.name}</span>
+                        <span className="evidence-sub">{t.artist}</span>
+                      </div>
+                      <div className="evidence-stats">
+                        <span style={{ color: '#f87171' }}>{t.skip_rate_pct}% skipped</span>
+                        <span>{t.total_plays} plays</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="no-data">No frequently-skipped liked tracks found</div>
+              )}
+            </SectionCard>
+          </div>
+        </>
+      )}
+
+      {listening && !listening.available && (
+        <div className="no-data" style={{ marginTop: 24 }}>
+          Import your Spotify Extended Streaming History (<code>import-history</code>) to unlock
+          real listening-behaviour analytics here.
+        </div>
+      )}
     </div>
   )
 }
