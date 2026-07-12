@@ -367,6 +367,14 @@ kbd {
 
 .no-data { color: var(--text-muted); font-size: 13px; padding: 24px 0; text-align: center; line-height: 1.6; }
 
+.heatmap-wrap { padding: 4px 0; }
+.heatmap-grid { display: flex; flex-direction: column; gap: 3px; }
+.heatmap-row { display: flex; align-items: center; gap: 3px; }
+.heatmap-dow-label { width: 32px; font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
+.heatmap-cell { flex: 1; aspect-ratio: 1; border-radius: 2px; min-width: 8px; max-width: 20px; }
+.heatmap-hour-labels { position: relative; height: 16px; margin-left: 35px; margin-top: 4px; }
+.heatmap-hour-labels span { position: absolute; font-size: 10px; color: var(--text-muted); }
+
 .evidence-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
 .evidence-row {
   display: flex; justify-content: space-between; align-items: center;

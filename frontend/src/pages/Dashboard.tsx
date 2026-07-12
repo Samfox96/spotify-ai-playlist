@@ -9,6 +9,7 @@ import axios from 'axios'
 interface DashboardData {
   totals: {
     liked_songs: number
+    all_tracks: number
     artists: number
     albums: number
     with_features: number
@@ -29,6 +30,11 @@ interface DashboardData {
   decade_breakdown: { decade: string; n: number }[]
   top_artists: { artist: string; n: number }[]
   energy_distribution: { bucket: string; n: number }[]
+  library_composition: { liked_only: number; playlist_only: number; streamed_only: number; overlapping: number }
+}
+
+interface HeatmapData {
+  cells: { dow: number; hour: number; n: number }[]
 }
 
 interface ListeningData {
@@ -78,6 +84,42 @@ function StatPill({ label, value, sub, accent }: { label: string; value: string 
   )
 }
 
+const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+function HeatmapGrid({ cells }: { cells: { dow: number; hour: number; n: number }[] }) {
+  const grid: number[][] = Array.from({ length: 7 }, () => Array(24).fill(0))
+  let max = 1
+  for (const c of cells) {
+    grid[c.dow][c.hour] = c.n
+    if (c.n > max) max = c.n
+  }
+  return (
+    <div className="heatmap-wrap">
+      <div className="heatmap-grid">
+        {grid.map((row, dow) => (
+          <div key={dow} className="heatmap-row">
+            <span className="heatmap-dow-label">{DOW_LABELS[dow]}</span>
+            {row.map((n, hour) => {
+              const intensity = n / max
+              return (
+                <div
+                  key={hour}
+                  className="heatmap-cell"
+                  style={{ background: intensity > 0 ? `rgba(124, 92, 191, ${0.12 + intensity * 0.88})` : 'var(--surface-2)' }}
+                  title={`${DOW_LABELS[dow]} ${hour}:00 — ${n.toLocaleString()} plays`}
+                />
+              )
+            })}
+          </div>
+        ))}
+      </div>
+      <div className="heatmap-hour-labels">
+        {[0, 6, 12, 18].map(h => <span key={h} style={{ left: `${(h / 24) * 100}%` }}>{h}:00</span>)}
+      </div>
+    </div>
+  )
+}
+
 function SectionCard({ title, children, className = '' }: { title: string; children: React.ReactNode; className?: string }) {
   return (
     <div className={`dash-card ${className}`}>
@@ -104,6 +146,7 @@ function CustomTooltip({ active, payload, label }: any) {
 export default function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null)
   const [listening, setListening] = useState<ListeningData | null>(null)
+  const [heatmap, setHeatmap] = useState<HeatmapData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -111,10 +154,12 @@ export default function Dashboard() {
     Promise.all([
       axios.get('/api/dashboard/overview'),
       axios.get('/api/dashboard/listening'),
+      axios.get('/api/dashboard/heatmap'),
     ])
-      .then(([overviewRes, listeningRes]) => {
+      .then(([overviewRes, listeningRes, heatmapRes]) => {
         setData(overviewRes.data)
         setListening(listeningRes.data)
+        setHeatmap(heatmapRes.data)
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
@@ -125,7 +170,7 @@ export default function Dashboard() {
   if (!data) return null
 
   const { totals, yearly_growth, top_genres, audio_features, review_breakdown,
-          decade_breakdown, top_artists, energy_distribution } = data
+          decade_breakdown, top_artists, energy_distribution, library_composition } = data
 
   // Radar chart data for audio features
   const radarData = [
@@ -162,11 +207,12 @@ export default function Dashboard() {
 
       {/* Top stats */}
       <div className="stat-pills">
-        <StatPill label="Liked Songs" value={totals.liked_songs} accent />
+        <StatPill label="All Tracks" value={totals.all_tracks.toLocaleString()} accent sub="Liked + playlists + streamed" />
+        <StatPill label="Liked Songs" value={totals.liked_songs} />
         <StatPill label="Artists" value={totals.artists} />
         <StatPill label="Albums" value={totals.albums} />
-        <StatPill label="Reviewed" value={`${totals.reviewed.toLocaleString()} / ${totals.liked_songs.toLocaleString()}`} sub={`${totals.review_pct}% complete`} />
-        <StatPill label="Audio Features" value={totals.with_features.toLocaleString()} sub={totals.with_features === 0 ? 'Not yet fetched' : `of ${totals.liked_songs.toLocaleString()}`} />
+        <StatPill label="Reviewed" value={`${totals.reviewed.toLocaleString()} / ${totals.all_tracks.toLocaleString()}`} sub={`${totals.review_pct}% complete`} />
+        <StatPill label="Audio Features" value={totals.with_features.toLocaleString()} sub={totals.with_features === 0 ? 'Not yet fetched' : `of ${totals.all_tracks.toLocaleString()}`} />
       </div>
 
       <div className="dash-grid">
@@ -222,7 +268,40 @@ export default function Dashboard() {
           )}
         </SectionCard>
 
-        {/* Top genres */}
+        {/* Library composition -- how tracks entered the library */}
+        <SectionCard title="Library Composition">
+          {(() => {
+            const compData = [
+              { name: 'Liked only', value: library_composition.liked_only, color: '#f9a8d4' },
+              { name: 'Playlist only', value: library_composition.playlist_only, color: '#7c5cbf' },
+              { name: 'Streamed only', value: library_composition.streamed_only, color: '#fbbf24' },
+              { name: 'Multiple sources', value: library_composition.overlapping, color: '#34d399' },
+            ].filter(d => d.value > 0)
+            return compData.length > 0 ? (
+              <>
+                <ResponsiveContainer width="100%" height={180}>
+                  <PieChart>
+                    <Pie data={compData} cx="50%" cy="50%" innerRadius={50} outerRadius={75} dataKey="value" paddingAngle={2}>
+                      {compData.map((entry, i) => <Cell key={i} fill={entry.color} />)}
+                    </Pie>
+                    <Tooltip formatter={((val: any, name: any) => [Number(val).toLocaleString(), name]) as any} />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="pie-legend">
+                  {compData.map(d => (
+                    <div key={d.name} className="pie-legend-item">
+                      <div className="pie-dot" style={{ background: d.color }} />
+                      <span>{d.name}</span>
+                      <span className="pie-count">{d.value.toLocaleString()}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : <div className="no-data">No composition data yet</div>
+          })()}
+        </SectionCard>
+
+
         <SectionCard title="Top Genres" className="span-2">
           {top_genres.length > 0 ? (
             <ResponsiveContainer width="100%" height={220}>
@@ -354,6 +433,15 @@ export default function Dashboard() {
                     <Bar dataKey="real_plays" name="Full plays (>30s)" fill="#34d399" radius={[3, 3, 0, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
+              ) : (
+                <div className="no-data">No listening history yet</div>
+              )}
+            </SectionCard>
+
+            {/* When you actually listen -- day x hour pattern */}
+            <SectionCard title="When You Listen" className="span-2">
+              {heatmap && heatmap.cells.length > 0 ? (
+                <HeatmapGrid cells={heatmap.cells} />
               ) : (
                 <div className="no-data">No listening history yet</div>
               )}

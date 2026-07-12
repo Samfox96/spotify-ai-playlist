@@ -565,12 +565,26 @@ def library_scopes():
         all_count = conn.execute(f"WITH {all_cte} SELECT COUNT(*) as n FROM scope_tracks").fetchone()["n"]
         liked_count = conn.execute("SELECT COUNT(*) as n FROM liked_songs").fetchone()["n"]
 
+        # Playlists can exist twice: once from the live API (real Spotify ID,
+        # metadata-only while Extended Quota Mode is pending -- 0 tracks
+        # linked) and once from the export importer (pseudo ID, full track
+        # data). Same playlist, same name -- dedupe by name and keep
+        # whichever copy actually has tracks linked.
         playlists = conn.execute("""
-            SELECT p.id, p.name, COUNT(pt.track_id) as track_count
-            FROM playlists p
-            LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
-            GROUP BY p.id
-            ORDER BY p.name COLLATE NOCASE
+            WITH counted AS (
+                SELECT p.id, p.name, COUNT(pt.track_id) as track_count
+                FROM playlists p
+                LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
+                GROUP BY p.id
+            ),
+            ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY name ORDER BY track_count DESC, id LIKE 'export:%' DESC
+                ) as rn
+                FROM counted
+            )
+            SELECT id, name, track_count FROM ranked WHERE rn = 1
+            ORDER BY name COLLATE NOCASE
         """).fetchall()
 
     return jsonify({
@@ -751,14 +765,41 @@ def run():
 # Dashboard Analytics
 # ---------------------------------------------------------------------------
 
+@app.route("/api/dashboard/heatmap")
+def dashboard_heatmap():
+    """When you actually listen -- day of week x hour of day. Answers
+    'patterns' questions overview stats can't: weekday mornings vs weekend
+    nights, etc."""
+    with db_conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                CAST(strftime('%w', played_at) AS INTEGER) as dow,
+                CAST(strftime('%H', played_at) AS INTEGER) as hour,
+                COUNT(*) as n
+            FROM play_history
+            WHERE source = 'spotify_export'
+            GROUP BY dow, hour
+        """).fetchall()
+    return jsonify({"cells": [dict(r) for r in rows]})
+
+
 @app.route("/api/dashboard/overview")
 def dashboard_overview():
-    """All data needed for the dashboard in one call."""
+    """All data needed for the dashboard in one call. Broadened to cover the
+    whole library (liked + playlists + heavily-streamed), not just liked
+    songs -- a track played 200 times via a playlist should show up in top
+    artists / decades / genres just as much as a liked one would."""
     import json
     from collections import Counter
 
+    all_cte, _ = _scope_tracks_cte("all")
+
     with db_conn() as conn:
-        # Songs added per year
+        _ensure_track_review_table(conn)
+
+        # Songs liked per year -- kept liked-specific since "added" has no
+        # single meaning across playlists/streams; this chart answers "when
+        # did I like things", not "when did I first hear things".
         yearly = conn.execute("""
             SELECT substr(liked_at, 1, 4) as year, COUNT(*) as n
             FROM liked_songs
@@ -766,14 +807,14 @@ def dashboard_overview():
             GROUP BY year ORDER BY year
         """).fetchall()
 
-        # Top genres from artist data
-        genre_rows = conn.execute("""
+        # Top genres across the whole library
+        genre_rows = conn.execute(f"""
+            WITH {all_cte}
             SELECT a.genres FROM artists a
             JOIN tracks t ON t.primary_artist_id = a.id
-            JOIN liked_songs ls ON ls.track_id = t.id
+            JOIN scope_tracks st ON st.track_id = t.id
             WHERE a.genres IS NOT NULL AND a.genres != '[]'
         """).fetchall()
-
         genre_counts = Counter()
         for r in genre_rows:
             try:
@@ -783,45 +824,53 @@ def dashboard_overview():
                 pass
         top_genres = [{"genre": g, "count": c} for g, c in genre_counts.most_common(12)]
 
-        # Audio feature averages
-        features = conn.execute("""
+        # Audio feature averages across the whole library
+        features = conn.execute(f"""
+            WITH {all_cte}
             SELECT
                 AVG(energy) as energy, AVG(valence) as valence,
                 AVG(danceability) as danceability, AVG(tempo) as tempo,
                 AVG(acousticness) as acousticness,
                 AVG(instrumentalness) as instrumentalness
             FROM audio_features af
-            JOIN liked_songs ls ON ls.track_id = af.track_id
+            JOIN scope_tracks st ON st.track_id = af.track_id
         """).fetchone()
 
-        # Review status breakdown
-        review_rows = conn.execute("""
-            SELECT review_status, COUNT(*) as n
-            FROM liked_songs GROUP BY review_status
+        # Review status breakdown across the whole library (track_review,
+        # not liked_songs.review_status -- matches the new Playlist Cleaner)
+        review_rows = conn.execute(f"""
+            WITH {all_cte}
+            SELECT COALESCE(tr.review_status, 'unreviewed') as review_status, COUNT(*) as n
+            FROM scope_tracks st
+            LEFT JOIN track_review tr ON tr.track_id = st.track_id
+            GROUP BY review_status
         """).fetchall()
 
-        # Decade breakdown
-        decade_rows = conn.execute("""
+        # Decade breakdown across the whole library
+        decade_rows = conn.execute(f"""
+            WITH {all_cte}
             SELECT substr(al.release_date, 1, 3) || '0s' as decade, COUNT(*) as n
-            FROM liked_songs ls
-            JOIN tracks t ON ls.track_id = t.id
+            FROM scope_tracks st
+            JOIN tracks t ON t.id = st.track_id
             JOIN albums al ON t.album_id = al.id
             WHERE al.release_date IS NOT NULL AND al.release_date != ''
             GROUP BY decade ORDER BY decade
         """).fetchall()
 
-        # Top artists by liked song count
-        top_artists = conn.execute("""
+        # Top artists across the whole library
+        top_artists = conn.execute(f"""
+            WITH {all_cte}
             SELECT t.primary_artist_name as artist, COUNT(*) as n
-            FROM liked_songs ls
-            JOIN tracks t ON ls.track_id = t.id
+            FROM scope_tracks st
+            JOIN tracks t ON t.id = st.track_id
             WHERE t.primary_artist_name IS NOT NULL
             GROUP BY t.primary_artist_name
             ORDER BY n DESC LIMIT 15
         """).fetchall()
 
-        # Energy distribution buckets
-        energy_dist = conn.execute("""
+        # Energy distribution across the whole library
+        energy_dist = conn.execute(f"""
+            WITH {all_cte}
             SELECT
                 CASE
                     WHEN energy < 0.2 THEN 'Very Low'
@@ -832,20 +881,58 @@ def dashboard_overview():
                 END as bucket,
                 COUNT(*) as n
             FROM audio_features af
-            JOIN liked_songs ls ON ls.track_id = af.track_id
+            JOIN scope_tracks st ON st.track_id = af.track_id
             GROUP BY bucket
         """).fetchall()
 
-        # Total counts
-        total = conn.execute("SELECT COUNT(*) as n FROM liked_songs").fetchone()["n"]
+        # Library composition: how a track entered the library. Directly
+        # visualizes the union concept -- e.g. a big "playlist only" slice
+        # shows how much listening never touches Liked Songs at all.
+        composition = conn.execute("""
+            WITH all_tracks AS (
+                SELECT track_id FROM liked_songs
+                UNION
+                SELECT track_id FROM playlist_tracks
+                UNION
+                SELECT track_id FROM (
+                    SELECT track_id, COUNT(*) as c FROM play_history
+                    WHERE source = 'spotify_export' GROUP BY track_id HAVING c >= 3
+                )
+            ),
+            flags AS (
+                SELECT
+                    at.track_id,
+                    EXISTS(SELECT 1 FROM liked_songs ls WHERE ls.track_id = at.track_id) as is_liked,
+                    EXISTS(SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = at.track_id) as is_playlisted,
+                    EXISTS(
+                        SELECT 1 FROM play_history ph WHERE ph.track_id = at.track_id
+                        AND ph.source = 'spotify_export' GROUP BY ph.track_id HAVING COUNT(*) >= 3
+                    ) as is_streamed
+                FROM all_tracks at
+            )
+            SELECT
+                SUM(CASE WHEN is_liked AND NOT is_playlisted AND NOT is_streamed THEN 1 ELSE 0 END) as liked_only,
+                SUM(CASE WHEN is_playlisted AND NOT is_liked AND NOT is_streamed THEN 1 ELSE 0 END) as playlist_only,
+                SUM(CASE WHEN is_streamed AND NOT is_liked AND NOT is_playlisted THEN 1 ELSE 0 END) as streamed_only,
+                SUM(CASE WHEN (CAST(is_liked as INT) + CAST(is_playlisted as INT) + CAST(is_streamed as INT)) >= 2 THEN 1 ELSE 0 END) as overlapping
+            FROM flags
+        """).fetchone()
+
+        # Total counts, now covering the whole library
+        total = conn.execute(f"WITH {all_cte} SELECT COUNT(*) as n FROM scope_tracks").fetchone()["n"]
+        total_liked = conn.execute("SELECT COUNT(*) as n FROM liked_songs").fetchone()["n"]
         total_artists = conn.execute("SELECT COUNT(*) as n FROM artists").fetchone()["n"]
         total_albums = conn.execute("SELECT COUNT(*) as n FROM albums").fetchone()["n"]
-        with_features = conn.execute("SELECT COUNT(*) as n FROM audio_features").fetchone()["n"]
-        reviewed = conn.execute("SELECT COUNT(*) as n FROM liked_songs WHERE review_status != 'unreviewed'").fetchone()["n"]
+        with_features = conn.execute(f"""
+            WITH {all_cte} SELECT COUNT(*) as n FROM scope_tracks st
+            JOIN audio_features af ON af.track_id = st.track_id
+        """).fetchone()["n"]
+        reviewed = total - (dict(zip([r["review_status"] for r in review_rows], [r["n"] for r in review_rows])).get("unreviewed", total))
 
     return jsonify({
         "totals": {
-            "liked_songs": total,
+            "liked_songs": total_liked,
+            "all_tracks": total,
             "artists": total_artists,
             "albums": total_albums,
             "with_features": with_features,
@@ -859,6 +946,7 @@ def dashboard_overview():
         "decade_breakdown": [dict(r) for r in decade_rows],
         "top_artists": [dict(r) for r in top_artists],
         "energy_distribution": [dict(r) for r in energy_dist],
+        "library_composition": dict(composition) if composition else {},
     })
 
 
