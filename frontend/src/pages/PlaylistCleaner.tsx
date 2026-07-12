@@ -346,10 +346,22 @@ export default function PlaylistCleaner({ onStatsChange }: Props) {
     <div className="queue-page">
       <div className="cleaner-header">
         <select className="scope-select" value={scope} onChange={e => changeScope(e.target.value)}>
-          {scopes.map(s => <option key={s.id} value={s.id}>{s.name} ({s.count.toLocaleString()})</option>)}
+          {scopes.map(s => (
+            <option key={s.id} value={s.id}>
+              {s.name} {s.pending_sync ? `(0/${s.expected_total} — not synced yet)` : `(${s.count.toLocaleString()})`}
+            </option>
+          ))}
         </select>
         <ShuffleTool scope={scope} scopeName={scopeName} />
       </div>
+
+      {currentScope?.pending_sync && (
+        <div className="pending-sync-banner">
+          ⏳ This playlist has {currentScope.expected_total} tracks on Spotify, but none are synced yet —
+          the live API is blocked pending Spotify's Extended Quota Mode approval. Re-export your
+          Spotify data or re-run <code>import-playlists</code> once approved to pull its contents in.
+        </div>
+      )}
 
       {loading ? (
         <div className="queue-loading"><div className="spinner" />Loading your queue...</div>

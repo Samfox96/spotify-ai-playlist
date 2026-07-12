@@ -37,6 +37,27 @@ interface HeatmapData {
   cells: { dow: number; hour: number; n: number }[]
 }
 
+interface HealthScoreData {
+  available: boolean
+  overall?: number
+  components?: {
+    review_progress: { score: number; detail: string }
+    freshness: { score: number; detail: string }
+    skip_health: { score: number; detail: string }
+    diversity: { score: number; detail: string }
+  }
+}
+
+interface MonthlyTrendData {
+  months: { month: string; plays: number; hours: number }[]
+}
+
+interface SkipDistData {
+  buckets: { bucket: string; n: number }[]
+}
+
+interface CompositionDetailTrack { track_id: string; name: string; artist: string }
+
 interface ListeningData {
   available: boolean
   overview?: {
@@ -80,6 +101,84 @@ function StatPill({ label, value, sub, accent }: { label: string; value: string 
       <div className="stat-pill-value">{typeof value === 'number' ? value.toLocaleString() : value}</div>
       <div className="stat-pill-label">{label}</div>
       {sub && <div className="stat-pill-sub">{sub}</div>}
+    </div>
+  )
+}
+
+function scoreColor(score: number): string {
+  if (score >= 75) return '#34d399'
+  if (score >= 50) return '#fbbf24'
+  return '#f87171'
+}
+
+function HealthScoreCard({ data }: { data: HealthScoreData }) {
+  if (!data.available || !data.overall || !data.components) {
+    return <div className="no-data">Import listening history to unlock a health score</div>
+  }
+  const items = [
+    { key: 'review_progress', label: 'Review Progress', ...data.components.review_progress },
+    { key: 'freshness', label: 'Freshness', ...data.components.freshness },
+    { key: 'skip_health', label: 'Skip Health', ...data.components.skip_health },
+    { key: 'diversity', label: 'Diversity', ...data.components.diversity },
+  ]
+  return (
+    <div className="health-score-wrap">
+      <div className="health-score-main">
+        <div className="health-score-circle" style={{ '--score-color': scoreColor(data.overall) } as any}>
+          <span className="health-score-number">{Math.round(data.overall)}</span>
+        </div>
+        <div className="health-score-label">Overall Library Health</div>
+      </div>
+      <div className="health-score-components">
+        {items.map(item => (
+          <div key={item.key} className="health-component">
+            <div className="health-component-header">
+              <span>{item.label}</span>
+              <span style={{ color: scoreColor(item.score) }}>{Math.round(item.score)}</span>
+            </div>
+            <div className="health-component-bar">
+              <div className="health-component-fill" style={{ width: `${item.score}%`, background: scoreColor(item.score) }} />
+            </div>
+            <div className="health-component-detail">{item.detail}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function CompositionDrilldown({ bucket, label }: { bucket: string; label: string }) {
+  const [tracks, setTracks] = useState<CompositionDetailTrack[] | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const load = () => {
+    setLoading(true)
+    axios.get('/api/dashboard/composition-detail', { params: { bucket } })
+      .then(r => setTracks(r.data.tracks))
+      .finally(() => setLoading(false))
+  }
+
+  return (
+    <div className="composition-drilldown">
+      {tracks === null ? (
+        <button className="drilldown-toggle" onClick={load} disabled={loading}>
+          {loading ? 'Loading…' : `Show tracks in "${label}"`}
+        </button>
+      ) : (
+        <>
+          <button className="drilldown-toggle" onClick={() => setTracks(null)}>Hide</button>
+          <div className="evidence-list">
+            {tracks.length > 0 ? tracks.map(t => (
+              <div key={t.track_id} className="evidence-row">
+                <div className="evidence-main">
+                  <span className="evidence-name">{t.name}</span>
+                  <span className="evidence-sub">{t.artist}</span>
+                </div>
+              </div>
+            )) : <div className="no-data">Nothing in this bucket</div>}
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -147,6 +246,9 @@ export default function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null)
   const [listening, setListening] = useState<ListeningData | null>(null)
   const [heatmap, setHeatmap] = useState<HeatmapData | null>(null)
+  const [health, setHealth] = useState<HealthScoreData | null>(null)
+  const [monthlyTrend, setMonthlyTrend] = useState<MonthlyTrendData | null>(null)
+  const [skipDist, setSkipDist] = useState<SkipDistData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -155,11 +257,17 @@ export default function Dashboard() {
       axios.get('/api/dashboard/overview'),
       axios.get('/api/dashboard/listening'),
       axios.get('/api/dashboard/heatmap'),
+      axios.get('/api/dashboard/health-score'),
+      axios.get('/api/dashboard/monthly-trend'),
+      axios.get('/api/dashboard/skip-distribution'),
     ])
-      .then(([overviewRes, listeningRes, heatmapRes]) => {
+      .then(([overviewRes, listeningRes, heatmapRes, healthRes, monthlyRes, skipRes]) => {
         setData(overviewRes.data)
         setListening(listeningRes.data)
         setHeatmap(heatmapRes.data)
+        setHealth(healthRes.data)
+        setMonthlyTrend(monthlyRes.data)
+        setSkipDist(skipRes.data)
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
@@ -214,6 +322,14 @@ export default function Dashboard() {
         <StatPill label="Reviewed" value={`${totals.reviewed.toLocaleString()} / ${totals.all_tracks.toLocaleString()}`} sub={`${totals.review_pct}% complete`} />
         <StatPill label="Audio Features" value={totals.with_features.toLocaleString()} sub={totals.with_features === 0 ? 'Not yet fetched' : `of ${totals.all_tracks.toLocaleString()}`} />
       </div>
+
+      {health && (
+        <div className="dash-grid">
+          <SectionCard title="Library Health Score" className="span-2">
+            <HealthScoreCard data={health} />
+          </SectionCard>
+        </div>
+      )}
 
       <div className="dash-grid">
 
@@ -272,10 +388,10 @@ export default function Dashboard() {
         <SectionCard title="Library Composition">
           {(() => {
             const compData = [
-              { name: 'Liked only', value: library_composition.liked_only, color: '#f9a8d4' },
-              { name: 'Playlist only', value: library_composition.playlist_only, color: '#7c5cbf' },
-              { name: 'Streamed only', value: library_composition.streamed_only, color: '#fbbf24' },
-              { name: 'Multiple sources', value: library_composition.overlapping, color: '#34d399' },
+              { name: 'Liked only', bucketKey: 'liked_only', value: library_composition.liked_only, color: '#f9a8d4' },
+              { name: 'Playlist only', bucketKey: 'playlist_only', value: library_composition.playlist_only, color: '#7c5cbf' },
+              { name: 'Streamed only', bucketKey: 'streamed_only', value: library_composition.streamed_only, color: '#fbbf24' },
+              { name: 'Multiple sources', bucketKey: 'overlapping', value: library_composition.overlapping, color: '#34d399' },
             ].filter(d => d.value > 0)
             return compData.length > 0 ? (
               <>
@@ -294,6 +410,11 @@ export default function Dashboard() {
                       <span>{d.name}</span>
                       <span className="pie-count">{d.value.toLocaleString()}</span>
                     </div>
+                  ))}
+                </div>
+                <div className="drilldown-row">
+                  {compData.map(d => (
+                    <CompositionDrilldown key={d.bucketKey} bucket={d.bucketKey} label={d.name} />
                   ))}
                 </div>
               </>
@@ -444,6 +565,38 @@ export default function Dashboard() {
                 <HeatmapGrid cells={heatmap.cells} />
               ) : (
                 <div className="no-data">No listening history yet</div>
+              )}
+            </SectionCard>
+
+            {/* Finer-grained than the yearly chart -- spot seasonal patterns and binges */}
+            <SectionCard title="Monthly Listening Trend" className="span-2">
+              {monthlyTrend && monthlyTrend.months.length > 0 ? (
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={monthlyTrend.months} margin={{ top: 4, right: 8, bottom: 0, left: -20 }}>
+                    <XAxis dataKey="month" tick={{ fontSize: 10, fill: 'var(--text-muted)' }} interval={2} />
+                    <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Bar dataKey="hours" name="Hours listened" fill="var(--accent)" radius={[3, 3, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="no-data">No listening history yet</div>
+              )}
+            </SectionCard>
+
+            {/* Is skipping concentrated in a few tracks, or spread evenly? */}
+            <SectionCard title="Skip Rate Distribution">
+              {skipDist && skipDist.buckets.some(b => b.n > 0) ? (
+                <ResponsiveContainer width="100%" height={180}>
+                  <BarChart data={skipDist.buckets} margin={{ top: 4, right: 8, bottom: 0, left: -20 }}>
+                    <XAxis dataKey="bucket" tick={{ fontSize: 10, fill: 'var(--text-muted)' }} />
+                    <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Bar dataKey="n" name="Tracks" fill="#f87171" radius={[3, 3, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="no-data">No skip data yet</div>
               )}
             </SectionCard>
 

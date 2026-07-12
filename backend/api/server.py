@@ -569,21 +569,31 @@ def library_scopes():
         # metadata-only while Extended Quota Mode is pending -- 0 tracks
         # linked) and once from the export importer (pseudo ID, full track
         # data). Same playlist, same name -- dedupe by name and keep
-        # whichever copy actually has tracks linked.
+        # whichever copy actually has the most tracks linked. We also carry
+        # forward the expected total (from Spotify's own playlist metadata,
+        # which IS available even when contents are quota-blocked) so a
+        # genuinely-empty playlist can be told apart from one that's just
+        # not synced yet.
         playlists = conn.execute("""
             WITH counted AS (
-                SELECT p.id, p.name, COUNT(pt.track_id) as track_count
+                SELECT p.id, p.name, p.total_tracks as expected_total,
+                       COUNT(pt.track_id) as track_count
                 FROM playlists p
                 LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
                 GROUP BY p.id
             ),
+            by_name AS (
+                SELECT name, MAX(COALESCE(expected_total, 0)) as best_expected
+                FROM counted GROUP BY name
+            ),
             ranked AS (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY name ORDER BY track_count DESC, id LIKE 'export:%' DESC
+                SELECT c.*, bn.best_expected, ROW_NUMBER() OVER (
+                    PARTITION BY c.name ORDER BY c.track_count DESC, c.id LIKE 'export:%' DESC
                 ) as rn
-                FROM counted
+                FROM counted c JOIN by_name bn ON bn.name = c.name
             )
-            SELECT id, name, track_count FROM ranked WHERE rn = 1
+            SELECT id, name, track_count, best_expected as expected_total
+            FROM ranked WHERE rn = 1
             ORDER BY name COLLATE NOCASE
         """).fetchall()
 
@@ -591,7 +601,11 @@ def library_scopes():
         "scopes": [
             {"id": "all", "name": "All Music", "count": all_count},
             {"id": "liked", "name": "Liked Songs", "count": liked_count},
-            *[{"id": p["id"], "name": p["name"], "count": p["track_count"]} for p in playlists],
+            *[{
+                "id": p["id"], "name": p["name"], "count": p["track_count"],
+                "expected_total": p["expected_total"] or 0,
+                "pending_sync": p["track_count"] == 0 and (p["expected_total"] or 0) > 0,
+            } for p in playlists],
         ]
     })
 
@@ -764,6 +778,163 @@ def run():
 # ---------------------------------------------------------------------------
 # Dashboard Analytics
 # ---------------------------------------------------------------------------
+
+@app.route("/api/dashboard/health-score")
+def dashboard_health_score():
+    """A single rollup metric summarizing library health, built from four
+    transparent, individually-visible components so it's never a black box:
+    - Review progress: how much of the library has been curated
+    - Freshness: how much of it you've actually played in the last 6 months
+    - Skip health: inverse of average skip rate (lower skips = healthier)
+    - Diversity: unique artists relative to library size
+    Each component and its raw inputs are returned alongside the score."""
+    all_cte, _ = _scope_tracks_cte("all")
+    with db_conn() as conn:
+        _ensure_track_review_table(conn)
+
+        total = conn.execute(f"WITH {all_cte} SELECT COUNT(*) as n FROM scope_tracks").fetchone()["n"]
+        if total == 0:
+            return jsonify({"available": False})
+
+        reviewed = conn.execute(f"""
+            WITH {all_cte}
+            SELECT COUNT(*) as n FROM scope_tracks st
+            LEFT JOIN track_review tr ON tr.track_id = st.track_id
+            WHERE COALESCE(tr.review_status, 'unreviewed') != 'unreviewed'
+        """).fetchone()["n"]
+        review_progress = round(reviewed / total * 100, 1)
+
+        fresh = conn.execute(f"""
+            WITH {all_cte}
+            SELECT COUNT(*) as n FROM scope_tracks st
+            JOIN play_history ph ON ph.track_id = st.track_id
+            WHERE ph.source = 'spotify_export' AND ph.played_at >= datetime('now', '-180 days')
+        """).fetchone()["n"]
+        freshness = round(min(fresh, total) / total * 100, 1)
+
+        skip_row = conn.execute(f"""
+            WITH {all_cte}
+            SELECT AVG(ph.skipped) * 100 as avg_skip
+            FROM play_history ph JOIN scope_tracks st ON st.track_id = ph.track_id
+            WHERE ph.source = 'spotify_export'
+        """).fetchone()
+        avg_skip = skip_row["avg_skip"] if skip_row and skip_row["avg_skip"] is not None else 0
+        skip_health = round(max(0, 100 - avg_skip), 1)
+
+        unique_artists = conn.execute(f"""
+            WITH {all_cte}
+            SELECT COUNT(DISTINCT t.primary_artist_name) as n
+            FROM scope_tracks st JOIN tracks t ON t.id = st.track_id
+            WHERE t.primary_artist_name IS NOT NULL
+        """).fetchone()["n"]
+        diversity = round(min(100, unique_artists / total * 300), 1)
+
+        overall = round((review_progress + freshness + skip_health + diversity) / 4, 1)
+
+    return jsonify({
+        "available": True,
+        "overall": overall,
+        "components": {
+            "review_progress": {"score": review_progress, "detail": f"{reviewed:,} of {total:,} tracks reviewed"},
+            "freshness": {"score": freshness, "detail": f"{fresh:,} tracks played in the last 6 months"},
+            "skip_health": {"score": skip_health, "detail": f"{round(avg_skip, 1)}% average skip rate"},
+            "diversity": {"score": diversity, "detail": f"{unique_artists:,} unique artists across {total:,} tracks"},
+        }
+    })
+
+
+@app.route("/api/dashboard/monthly-trend")
+def dashboard_monthly_trend():
+    """Finer-grained than the yearly chart -- month-by-month listening
+    volume, useful for spotting seasonal patterns or specific binges."""
+    with db_conn() as conn:
+        rows = conn.execute("""
+            SELECT substr(played_at, 1, 7) as month, COUNT(*) as plays,
+                   ROUND(SUM(ms_played) / 3600000.0, 1) as hours
+            FROM play_history
+            WHERE source = 'spotify_export'
+            GROUP BY month ORDER BY month
+        """).fetchall()
+    return jsonify({"months": [dict(r) for r in rows]})
+
+
+@app.route("/api/dashboard/skip-distribution")
+def dashboard_skip_distribution():
+    """Histogram of skip rates across tracks with meaningful play counts --
+    shows whether skipping is concentrated in a few tracks or spread evenly."""
+    with db_conn() as conn:
+        rows = conn.execute("""
+            WITH per_track AS (
+                SELECT track_id, AVG(skipped) * 100 as skip_pct, COUNT(*) as plays
+                FROM play_history WHERE source = 'spotify_export'
+                GROUP BY track_id HAVING plays >= 3
+            )
+            SELECT
+                CASE
+                    WHEN skip_pct = 0 THEN '0%'
+                    WHEN skip_pct < 25 THEN '1-24%'
+                    WHEN skip_pct < 50 THEN '25-49%'
+                    WHEN skip_pct < 75 THEN '50-74%'
+                    ELSE '75-100%'
+                END as bucket,
+                COUNT(*) as n
+            FROM per_track
+            GROUP BY bucket
+        """).fetchall()
+    order = ['0%', '1-24%', '25-49%', '50-74%', '75-100%']
+    buckets = {r["bucket"]: r["n"] for r in rows}
+    return jsonify({"buckets": [{"bucket": b, "n": buckets.get(b, 0)} for b in order]})
+
+
+@app.route("/api/dashboard/composition-detail")
+def dashboard_composition_detail():
+    """Drill-down for the Library Composition chart -- returns the actual
+    tracks in a bucket so a surprising number (e.g. a small 'liked only'
+    count) can be verified rather than just trusted."""
+    bucket = request.args.get("bucket", "liked_only")
+    limit = int(request.args.get("limit", 30))
+    valid = {"liked_only", "playlist_only", "streamed_only", "overlapping"}
+    if bucket not in valid:
+        return jsonify({"error": "invalid bucket"}), 400
+
+    with db_conn() as conn:
+        rows = conn.execute("""
+            WITH all_tracks AS (
+                SELECT track_id FROM liked_songs
+                UNION
+                SELECT track_id FROM playlist_tracks
+                UNION
+                SELECT track_id FROM (
+                    SELECT track_id, COUNT(*) as c FROM play_history
+                    WHERE source = 'spotify_export' GROUP BY track_id HAVING c >= 3
+                )
+            ),
+            flags AS (
+                SELECT
+                    at.track_id,
+                    EXISTS(SELECT 1 FROM liked_songs ls WHERE ls.track_id = at.track_id) as is_liked,
+                    EXISTS(SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = at.track_id) as is_playlisted,
+                    EXISTS(
+                        SELECT 1 FROM play_history ph WHERE ph.track_id = at.track_id
+                        AND ph.source = 'spotify_export' GROUP BY ph.track_id HAVING COUNT(*) >= 3
+                    ) as is_streamed
+                FROM all_tracks at
+            )
+            SELECT f.track_id, t.name, t.primary_artist_name as artist,
+                   f.is_liked, f.is_playlisted, f.is_streamed
+            FROM flags f JOIN tracks t ON t.id = f.track_id
+            WHERE
+                CASE ?
+                    WHEN 'liked_only' THEN f.is_liked AND NOT f.is_playlisted AND NOT f.is_streamed
+                    WHEN 'playlist_only' THEN f.is_playlisted AND NOT f.is_liked AND NOT f.is_streamed
+                    WHEN 'streamed_only' THEN f.is_streamed AND NOT f.is_liked AND NOT f.is_playlisted
+                    WHEN 'overlapping' THEN (CAST(f.is_liked as INT) + CAST(f.is_playlisted as INT) + CAST(f.is_streamed as INT)) >= 2
+                END
+            LIMIT ?
+        """, (bucket, limit)).fetchall()
+
+    return jsonify({"bucket": bucket, "tracks": [dict(r) for r in rows]})
+
 
 @app.route("/api/dashboard/heatmap")
 def dashboard_heatmap():
