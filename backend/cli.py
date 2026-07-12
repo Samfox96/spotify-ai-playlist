@@ -61,6 +61,15 @@ def cmd_import_playlists(args):
         f"| {counts['skipped_non_track']} skipped (local/removed) | {counts['errors']} errors\n"
     )
 
+def cmd_import_playlists_export(args):
+    from backend.importers.playlist_export_importer import import_playlists_from_export
+    print(f"\nImporting playlists from export: {args.export}\n")
+    counts = import_playlists_from_export(args.export)
+    print(
+        f"\nDone: {counts['playlists']} playlists | {counts['tracks_linked']} tracks linked "
+        f"| {counts['tracks_stubbed']} new tracks discovered | {counts['skipped_non_track']} skipped\n"
+    )
+
 def cmd_stats(args):
     from backend.db.database import init_db, db_conn
     import json
@@ -131,6 +140,10 @@ def main():
 
     p_playlists = sub.add_parser("import-playlists", help="Import all playlists and their tracks")
     p_playlists.set_defaults(func=cmd_import_playlists)
+
+    p_playlists_export = sub.add_parser("import-playlists-export", help="Import playlists from the Spotify Account Data export (workaround while API is quota-blocked)")
+    p_playlists_export.add_argument("--export", required=True, help="Path to 'Spotify Account Data' folder from your export")
+    p_playlists_export.set_defaults(func=cmd_import_playlists_export)
 
     p_stats = sub.add_parser("stats")
     p_stats.set_defaults(func=cmd_stats)
